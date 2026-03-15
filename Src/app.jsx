@@ -1,0 +1,752 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const FAPI = "https://fapi.binance.com";
+const TG_TOKEN = "8695859548:AAE2-rbTuF9baPBkUTM5aWFsXQgrssyRGxU";
+const TG_CHAT_ID = "6216696248";
+
+// ─── Telegram ────────────────────────────────────────────────────────────────
+async function sendTelegram(text) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+        disable_notification: false,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) console.warn("Telegram error:", data.description);
+  } catch (e) {
+    console.warn("Telegram failed:", e.message);
+  }
+}
+
+// ─── Audio alert ─────────────────────────────────────────────────────────────
+function playAlert(type = "flip") {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const sequences = {
+      flip:    [{ f: 880, t: 0, d: 0.12 }, { f: 1100, t: 0.14, d: 0.18 }],
+      confirm: [{ f: 660, t: 0 }, { f: 880, t: 0.12 }, { f: 1320, t: 0.24, d: 0.25 }],
+      extreme: [{ f: 440, t: 0, d: 0.08 }, { f: 440, t: 0.10, d: 0.08 }, { f: 660, t: 0.22, d: 0.2 }],
+    };
+    (sequences[type] || sequences.flip).forEach(({ f, t, d = 0.15 }) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value = f;
+      o.type = "sine";
+      g.gain.setValueAtTime(0.3, ctx.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + d);
+      o.start(ctx.currentTime + t);
+      o.stop(ctx.currentTime + t + d + 0.05);
+    });
+  } catch {}
+}
+
+// ─── Browser notification ─────────────────────────────────────────────────────
+async function sendNotification(title, body, tag) {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") await Notification.requestPermission();
+  if (Notification.permission === "granted") {
+    new Notification(title, { body, tag, icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>🔀</text></svg>" });
+  }
+}
+
+// ─── RSI ──────────────────────────────────────────────────────────────────────
+function calcRSI(closes, p = 14) {
+  if (closes.length < p + 1) return null;
+  let g = 0, l = 0;
+  for (let i = closes.length - p; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) g += d; else l += Math.abs(d);
+  }
+  const ag = g / p, al = l / p;
+  return al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+}
+
+// ─── Time helpers ─────────────────────────────────────────────────────────────
+function fmtCountdown(ms) {
+  if (ms <= 0) return "NOW";
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function getRefreshInterval(nextFundingTime) {
+  const ms = nextFundingTime - Date.now();
+  if (ms < 15 * 60 * 1000)  return 10000;
+  if (ms < 60 * 60 * 1000)  return 30000;
+  if (ms < 3 * 3600 * 1000) return 120000;
+  return 300000;
+}
+
+function getZone(ms) {
+  if (ms < 15 * 60 * 1000)  return { label: "🔥 HOT ZONE", color: "#ff1744", bg: "#1a0505" };
+  if (ms < 60 * 60 * 1000)  return { label: "⚡ WARMING",  color: "#f0c040", bg: "#161206" };
+  if (ms < 3 * 3600 * 1000) return { label: "👁 WATCHING",  color: "#89b4fa", bg: "#060d1a" };
+  return                            { label: "😴 IDLE",      color: "#45475a", bg: "#07080c" };
+}
+
+// ─── History bars ─────────────────────────────────────────────────────────────
+function HistoryBars({ history, current }) {
+  if (!history?.length) return <span style={{ color: "#2a2d3e" }}>—</span>;
+  const all = [...history, current];
+  const max = Math.max(...all.map(v => Math.abs(v))) || 0.0001;
+  return (
+    <div style={{ display: "flex", gap: 2, alignItems: "flex-end", justifyContent: "flex-end", height: 22 }}>
+      {history.map((v, i) => (
+        <div key={i} style={{
+          width: 5, borderRadius: 2,
+          height: `${Math.max(20, Math.round(80 * Math.abs(v) / max))}%`,
+          background: v < 0
+            ? `rgba(76,175,80,${0.35 + 0.65 * Math.abs(v) / max})`
+            : `rgba(239,83,80,${0.35 + 0.65 * Math.abs(v) / max})`,
+        }} />
+      ))}
+      <div style={{
+        width: 7, borderRadius: 2,
+        height: `${Math.max(20, Math.round(80 * Math.abs(current) / max))}%`,
+        background: current < 0 ? "#00e676" : "#ff1744",
+        boxShadow: current < 0 ? "0 0 6px #00e676" : "0 0 6px #ff1744",
+        border: "1px solid rgba(255,255,255,0.3)",
+      }} />
+    </div>
+  );
+}
+
+// ─── Alert toast ──────────────────────────────────────────────────────────────
+function AlertToast({ alert, onDismiss }) {
+  const colors = {
+    FLIP_LONG_CONF:  { border: "#00e676", text: "#00e676", glow: "0 0 20px rgba(0,230,118,0.4)" },
+    FLIP_SHORT_CONF: { border: "#ff1744", text: "#ff1744", glow: "0 0 20px rgba(255,23,68,0.4)" },
+    FLIP_LONG:       { border: "#4caf50", text: "#4caf50", glow: "0 0 12px rgba(76,175,80,0.3)" },
+    FLIP_SHORT:      { border: "#ef5350", text: "#ef5350", glow: "0 0 12px rgba(239,83,80,0.3)" },
+  };
+  const c = colors[alert.signal] || colors.FLIP_LONG;
+  return (
+    <div style={{
+      background: "#0d0f16", border: `1px solid ${c.border}`,
+      borderRadius: 8, padding: "10px 14px", boxShadow: c.glow,
+      display: "flex", alignItems: "center", gap: 12,
+      animation: "slideIn 0.3s ease", cursor: "pointer",
+    }} onClick={onDismiss}>
+      <div>
+        <div style={{ color: c.text, fontWeight: 700, fontSize: 12 }}>
+          {alert.signal?.includes("LONG") ? "🔀 FLIP LONG" : "🔀 FLIP SHORT"}
+          {alert.signal?.endsWith("CONF") && " + RSI ⚡"}
+        </div>
+        <div style={{ color: "#cdd6f4", fontSize: 13, fontWeight: 700 }}>
+          {alert.symbol.replace("USDT", "")}
+        </div>
+        <div style={{ color: "#6c7086", fontSize: 10, marginTop: 2 }}>
+          Predicted: {parseFloat(alert.predictedPct) > 0 ? "+" : ""}{alert.predictedPct}%
+          {alert.rsi && ` | RSI ${alert.rsi}`}
+        </div>
+      </div>
+      <div style={{ color: "#313244", fontSize: 10, marginLeft: "auto" }}>✕</div>
+    </div>
+  );
+}
+
+// ─── Telegram status badge ────────────────────────────────────────────────────
+function TgBadge({ status }) {
+  const cfg = {
+    idle:    { color: "#45475a", label: "✈️ TG READY" },
+    sending: { color: "#f0c040", label: "📤 SENDING…" },
+    ok:      { color: "#4caf50", label: "✅ TG SENT" },
+    err:     { color: "#ef5350", label: "❌ TG FAIL" },
+  };
+  const c = cfg[status] || cfg.idle;
+  return (
+    <span style={{
+      fontSize: 9, color: c.color,
+      border: `1px solid ${c.color}`,
+      padding: "2px 7px", borderRadius: 3,
+      fontFamily: "inherit",
+    }}>{c.label}</span>
+  );
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
+export default function FlipScannerV3() {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [phase, setPhase] = useState("Starting…");
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [nextFunding, setNextFunding] = useState(null);
+  const [refreshIn, setRefreshIn] = useState(null);
+  const [refreshMs, setRefreshMs] = useState(300000);
+  const [toasts, setToasts] = useState([]);
+  const [alertLog, setAlertLog] = useState([]);
+  const [tab, setTab] = useState("FLIPS");
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("flip");
+  const [minFlip, setMinFlip] = useState(0.002);
+  const [notifEnabled, setNotifEnabled] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [tgEnabled, setTgEnabled] = useState(true);
+  const [tgStatus, setTgStatus] = useState("idle");
+  const [showLog, setShowLog] = useState(false);
+  const [tick, setTick] = useState(0);
+
+  const timerRef = useRef(null);
+  const tickRef  = useRef(null);
+  const alertedRef = useRef(new Set());
+
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "granted") setNotifEnabled(true);
+  }, []);
+
+  const enableNotifications = async () => {
+    if (!("Notification" in window)) return alert("Browser doesn't support notifications");
+    const perm = await Notification.requestPermission();
+    setNotifEnabled(perm === "granted");
+  };
+
+  // ─── Fire alert (sound + browser notif + Telegram) ──────────────────────────
+  const fireAlert = useCallback(async (row) => {
+    const key = `${row.symbol}-${Math.floor(Date.now() / 3600000)}`;
+    if (alertedRef.current.has(key)) return;
+    alertedRef.current.add(key);
+
+    if (soundEnabled) playAlert(row.signal?.endsWith("CONF") ? "confirm" : "flip");
+    if (notifEnabled) {
+      sendNotification(
+        `🔀 ${row.symbol.replace("USDT", "")} Funding Flip!`,
+        `${row.signal?.includes("LONG") ? "LONG" : "SHORT"} signal\nPredicted: ${row.predictedPct}% | RSI: ${row.rsi ?? "N/A"}`,
+        row.symbol
+      );
+    }
+
+    // ── Telegram message ──────────────────────────────────────────────────────
+    if (tgEnabled) {
+      const dir    = row.signal?.includes("LONG") ? "🟢 FLIP LONG" : "🔴 FLIP SHORT";
+      const conf   = row.signal?.endsWith("CONF") ? " <b>+ RSI CONFIRMED ⚡</b>" : "";
+      const coin   = row.symbol.replace("USDT", "");
+      const pred   = (parseFloat(row.predictedPct) > 0 ? "+" : "") + row.predictedPct + "%";
+      const sett   = (parseFloat(row.settledPct)   > 0 ? "+" : "") + row.settledPct   + "%";
+      const rsiStr = row.rsi   ? `RSI: <b>${row.rsi}</b>` : "RSI: —";
+      const volStr = row.volRatio ? `Vol: <b>${row.volRatio}×</b>` : "";
+      const zone   = nextFunding
+        ? `⏱ Settlement in: <b>${fmtCountdown(nextFunding - Date.now())}</b>`
+        : "";
+
+      const msg =
+`🔀 <b>FUNDING FLIP SCANNER</b>
+${dir}${conf}
+
+Coin: <b>${coin}/USDT</b>
+Predicted FR: <b>${pred}</b>
+Settled FR: ${sett}
+${rsiStr}  ${volStr}
+${zone}
+
+<i>Binance USDT Perps · Flip Size ≥ ${minFlip}%</i>`;
+
+      setTgStatus("sending");
+      try {
+        await sendTelegram(msg);
+        setTgStatus("ok");
+      } catch {
+        setTgStatus("err");
+      }
+      setTimeout(() => setTgStatus("idle"), 4000);
+    }
+
+    const entry = { ...row, time: new Date().toLocaleTimeString(), id: Date.now() + Math.random() };
+    setToasts(t => [entry, ...t].slice(0, 4));
+    setAlertLog(l => [entry, ...l].slice(0, 50));
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== entry.id)), 8000);
+  }, [soundEnabled, notifEnabled, tgEnabled, minFlip, nextFunding]);
+
+  // ─── Fetch ────────────────────────────────────────────────────────────────────
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      setPhase("Fetching premium index…");
+      const r = await fetch(`${FAPI}/fapi/v1/premiumIndex`);
+      const premiums = await r.json();
+      const perps = premiums.filter(x => x.symbol.endsWith("USDT"));
+
+      const commonNext = Math.max(...perps.map(p => p.nextFundingTime));
+      setNextFunding(commonNext);
+      const interval = getRefreshInterval(commonNext);
+      setRefreshMs(interval);
+      setRefreshIn(interval / 1000);
+
+      clearInterval(timerRef.current);
+      timerRef.current = setInterval(() => fetchAll(), interval);
+
+      setPhase("Fetching settled funding history…");
+      const BATCH = 20;
+      const histMap = {};
+      for (let i = 0; i < perps.length; i += BATCH) {
+        const batch = perps.slice(i, i + BATCH);
+        await Promise.all(batch.map(async ({ symbol }) => {
+          try {
+            const hr = await fetch(`${FAPI}/fapi/v1/fundingRate?symbol=${symbol}&limit=5`);
+            const hist = await hr.json();
+            histMap[symbol] = hist.map(h => parseFloat(h.fundingRate));
+          } catch { histMap[symbol] = []; }
+        }));
+        setPhase(`History: ${Math.min(i + BATCH, perps.length)}/${perps.length}`);
+      }
+
+      const withFlip = perps.map(coin => {
+        const mark = parseFloat(coin.markPrice);
+        const index = parseFloat(coin.indexPrice);
+        const predicted = index > 0 ? (mark - index) / index : 0;
+        const history = histMap[coin.symbol] || [];
+        const settled = history.length > 0 ? history[history.length - 1] : parseFloat(coin.lastFundingRate);
+        const baseline = history.length >= 2
+          ? history.slice(-3).reduce((a, b) => a + b, 0) / Math.min(3, history.length)
+          : settled;
+        const delta = predicted - baseline;
+        const signFlip = (baseline > 0 && predicted < 0) || (baseline < 0 && predicted > 0);
+        const flipScore = Math.abs(delta) * 100 + (signFlip ? 0.01 : 0);
+        return { coin, predicted, settled, history, baseline, delta, signFlip, flipScore };
+      });
+
+      const top30 = [...withFlip].sort((a, b) => b.flipScore - a.flipScore).slice(0, 30);
+
+      setPhase("Enriching top 30 with RSI & Volume…");
+      const enrichMap = {};
+      for (let i = 0; i < top30.length; i += 10) {
+        await Promise.all(top30.slice(i, i + 10).map(async ({ coin }) => {
+          try {
+            const kr = await fetch(`${FAPI}/fapi/v1/klines?symbol=${coin.symbol}&interval=15m&limit=22`);
+            const klines = await kr.json();
+            const closes = klines.map(k => parseFloat(k[4]));
+            const vols   = klines.map(k => parseFloat(k[5]));
+            const rsi  = calcRSI(closes);
+            const last = vols[vols.length - 1] || 0;
+            const avg  = vols.slice(-10, -1).reduce((a, b) => a + b, 0) / 9 || 1;
+            enrichMap[coin.symbol] = { rsi, volRatio: last / avg };
+          } catch { enrichMap[coin.symbol] = { rsi: null, volRatio: null }; }
+        }));
+      }
+
+      const processed = withFlip.map(({ coin, predicted, settled, history, baseline, delta, signFlip, flipScore }) => {
+        const e = enrichMap[coin.symbol] || {};
+        const predictedPct = (predicted * 100).toFixed(4);
+        const settledPct   = (settled   * 100).toFixed(4);
+        const basePct      = (baseline  * 100).toFixed(4);
+        const deltaPct     = (delta     * 100).toFixed(4);
+        const rsi    = e.rsi != null ? e.rsi.toFixed(1) : null;
+        const rsiNum = rsi ? parseFloat(rsi) : null;
+
+        let signal = null;
+        const isFlip    = signFlip && Math.abs(delta * 100) >= minFlip;
+        const isExtreme = !signFlip && Math.abs(delta * 100) >= minFlip * 1.5;
+        if (isFlip)    signal = predicted < 0 ? "FLIP_LONG"    : "FLIP_SHORT";
+        else if (isExtreme) signal = predicted < 0 ? "EXTREME_LONG" : "EXTREME_SHORT";
+        if (signal === "FLIP_LONG"  && rsiNum && rsiNum < 40) signal = "FLIP_LONG_CONF";
+        if (signal === "FLIP_SHORT" && rsiNum && rsiNum > 60) signal = "FLIP_SHORT_CONF";
+
+        return {
+          symbol: coin.symbol, mark: parseFloat(coin.markPrice),
+          predictedPct, settledPct, basePct, deltaPct,
+          signFlip, history: history.slice(-5), predicted,
+          rsi, rsiNum,
+          volRatio: e.volRatio != null ? parseFloat(e.volRatio.toFixed(2)) : null,
+          signal, flipScore: Math.round(flipScore * 10000) / 10000,
+          nextFunding: coin.nextFundingTime,
+        };
+      });
+
+      processed.filter(r => r.signal?.startsWith("FLIP")).forEach(r => fireAlert(r));
+      setRows(processed);
+      setLastUpdate(new Date());
+      setPhase(`${perps.length} pairs • next fund in ${fmtCountdown(commonNext - Date.now())}`);
+    } catch (e) {
+      setPhase("Error: " + e.message);
+    }
+    setLoading(false);
+  }, [minFlip, fireAlert]);
+
+  useEffect(() => {
+    fetchAll();
+    tickRef.current = setInterval(() => setTick(t => t + 1), 1000);
+    return () => { clearInterval(timerRef.current); clearInterval(tickRef.current); };
+  }, [fetchAll]);
+
+  useEffect(() => {
+    if (!loading) setRefreshIn(r => (r > 0 ? r - 1 : r));
+  }, [tick]);
+
+  const zone = nextFunding ? getZone(nextFunding - Date.now()) : { label: "—", color: "#45475a", bg: "#07080c" };
+  const timeToFund = nextFunding ? nextFunding - Date.now() : null;
+
+  const signalMeta = {
+    FLIP_LONG_CONF:  { border: "#00e676", text: "#00e676", label: "🔀⚡ FLIP LONG + RSI" },
+    FLIP_SHORT_CONF: { border: "#ff1744", text: "#ff1744", label: "🔀⚡ FLIP SHORT + RSI" },
+    FLIP_LONG:       { border: "#4caf50", text: "#4caf50", label: "🔀 FLIP LONG" },
+    FLIP_SHORT:      { border: "#ef5350", text: "#ef5350", label: "🔀 FLIP SHORT" },
+    EXTREME_LONG:    { border: "#66bb6a", text: "#66bb6a", label: "📉 EXTREME LONG" },
+    EXTREME_SHORT:   { border: "#e57373", text: "#e57373", label: "📈 EXTREME SHORT" },
+  };
+
+  const filtered = rows
+    .filter(r => {
+      if (tab === "FLIPS")   return r.signal?.startsWith("FLIP");
+      if (tab === "EXTREME") return r.signal?.startsWith("EXTREME");
+      return true;
+    })
+    .filter(r => !search || r.symbol.toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => {
+      if (sortBy === "flip") return b.flipScore - a.flipScore;
+      if (sortBy === "pred") return Math.abs(parseFloat(b.predictedPct)) - Math.abs(parseFloat(a.predictedPct));
+      if (sortBy === "rsi")  return (a.rsiNum ?? 50) - (b.rsiNum ?? 50);
+      if (sortBy === "vol")  return (b.volRatio ?? 0) - (a.volRatio ?? 0);
+      return 0;
+    });
+
+  return (
+    <div style={{ background: "#07080c", minHeight: "100vh", color: "#cdd6f4",
+      fontFamily: "'JetBrains Mono','Fira Code',monospace", fontSize: 12 }}>
+
+      <style>{`
+        @keyframes slideIn { from { opacity:0; transform:translateX(40px); } to { opacity:1; transform:translateX(0); } }
+        @keyframes pulse   { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+        @keyframes glow    { 0%,100% { box-shadow:0 0 8px rgba(255,23,68,0.3); } 50% { box-shadow:0 0 20px rgba(255,23,68,0.7); } }
+        tr:hover { background: rgba(255,255,255,0.03) !important; }
+        ::-webkit-scrollbar { width:4px; height:4px; }
+        ::-webkit-scrollbar-track { background:#0b0d12; }
+        ::-webkit-scrollbar-thumb { background:#2a2d3e; border-radius:2px; }
+      `}</style>
+
+      {/* Toasts */}
+      <div style={{ position:"fixed", top:16, right:16, zIndex:999, display:"flex", flexDirection:"column", gap:8, width:300 }}>
+        {toasts.map(t => (
+          <AlertToast key={t.id} alert={t} onDismiss={() => setToasts(x => x.filter(a => a.id !== t.id))} />
+        ))}
+      </div>
+
+      {/* ── HEADER ── */}
+      <div style={{
+        background: "linear-gradient(180deg,#0d0f18 0%,#07080c 100%)",
+        borderBottom: "1px solid #1a1d2e",
+        padding: "12px 20px",
+        position: "sticky", top:0, zIndex:100,
+        display:"flex", alignItems:"center", justifyContent:"space-between", gap:12,
+      }}>
+        <div>
+          <div style={{ fontSize:14, fontWeight:700, letterSpacing:2, color:"#f0c040" }}>
+            🔀 FUNDING FLIP SCANNER <span style={{ fontSize:9, color:"#45475a", fontWeight:400 }}>v3 · PREDICTED RATE</span>
+          </div>
+          <div style={{ fontSize:9, color:"#45475a", marginTop:2 }}>
+            BINANCE USDT PERPS · SMART AUTO-REFRESH · REAL-TIME PREDICTED FUNDING
+          </div>
+        </div>
+
+        {/* Settlement clock */}
+        <div style={{
+          background: zone.bg, border:`1px solid ${zone.color}`,
+          borderRadius:8, padding:"6px 14px", textAlign:"center",
+          animation: timeToFund && timeToFund < 15*60000 ? "glow 1.5s infinite" : "none",
+        }}>
+          <div style={{ fontSize:9, color:zone.color, letterSpacing:1, fontWeight:700 }}>{zone.label}</div>
+          <div style={{ fontSize:18, fontWeight:700, color:"#cdd6f4", letterSpacing:2 }}>
+            {timeToFund ? fmtCountdown(timeToFund) : "—"}
+          </div>
+          <div style={{ fontSize:9, color:"#45475a" }}>TO SETTLEMENT</div>
+        </div>
+
+        {/* Refresh badge */}
+        <div style={{ textAlign:"center" }}>
+          <div style={{ fontSize:9, color:"#45475a", letterSpacing:1 }}>REFRESH IN</div>
+          <div style={{ fontSize:20, fontWeight:700, color: refreshIn && refreshIn < 30 ? "#f0c040" : "#89b4fa" }}>
+            {loading ? "—" : `${refreshIn ?? "—"}s`}
+          </div>
+          <div style={{ fontSize:9, color:"#45475a" }}>
+            {refreshMs >= 300000 ? "5m IDLE" : refreshMs >= 120000 ? "2m WATCH" : refreshMs >= 30000 ? "30s WARM" : "10s 🔥"}
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+          <div style={{ display:"flex", gap:4, alignItems:"center" }}>
+            <span style={{ fontSize:9, color:"#45475a", letterSpacing:1 }}>FLIP SIZE:</span>
+            {[0.001,0.002,0.003,0.005].map(t => (
+              <button key={t} onClick={() => setMinFlip(t)} style={{
+                background: minFlip===t ? "#f0c040" : "#1a1d2e",
+                border:`1px solid ${minFlip===t ? "#f0c040":"#2a2d3e"}`,
+                color: minFlip===t ? "#07080c" : "#6c7086",
+                padding:"2px 7px", borderRadius:3, cursor:"pointer",
+                fontSize:9, fontWeight: minFlip===t?700:400, fontFamily:"inherit",
+              }}>{t}%</button>
+            ))}
+          </div>
+          <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+            <button onClick={() => setSoundEnabled(s => !s)} style={{
+              background: soundEnabled ? "#1a2e1a" : "#1a1d2e",
+              border:`1px solid ${soundEnabled?"#4caf50":"#2a2d3e"}`,
+              color: soundEnabled ? "#4caf50":"#45475a",
+              padding:"2px 8px", borderRadius:3, cursor:"pointer", fontSize:9, fontFamily:"inherit",
+            }}>🔊 {soundEnabled ? "SOUND ON" : "SOUND OFF"}</button>
+
+            <button onClick={notifEnabled ? () => setNotifEnabled(false) : enableNotifications} style={{
+              background: notifEnabled ? "#1a201a" : "#1a1d2e",
+              border:`1px solid ${notifEnabled?"#4caf50":"#2a2d3e"}`,
+              color: notifEnabled ? "#4caf50":"#45475a",
+              padding:"2px 8px", borderRadius:3, cursor:"pointer", fontSize:9, fontFamily:"inherit",
+            }}>🔔 {notifEnabled ? "NOTIFS ON" : "ENABLE NOTIFS"}</button>
+
+            {/* ── Telegram toggle ── */}
+            <button onClick={() => setTgEnabled(s => !s)} style={{
+              background: tgEnabled ? "#0d1a2a" : "#1a1d2e",
+              border:`1px solid ${tgEnabled?"#229ED9":"#2a2d3e"}`,
+              color: tgEnabled ? "#229ED9":"#45475a",
+              padding:"2px 8px", borderRadius:3, cursor:"pointer", fontSize:9, fontFamily:"inherit",
+            }}>✈️ {tgEnabled ? "TG ON" : "TG OFF"}</button>
+
+            <TgBadge status={tgStatus} />
+
+            <button onClick={() => setShowLog(s => !s)} style={{
+              background: showLog ? "#1a1d2e" : "transparent",
+              border:`1px solid ${alertLog.length>0?"#f0c040":"#2a2d3e"}`,
+              color: alertLog.length>0 ? "#f0c040":"#45475a",
+              padding:"2px 8px", borderRadius:3, cursor:"pointer", fontSize:9, fontFamily:"inherit",
+            }}>📋 LOG ({alertLog.length})</button>
+
+            <button onClick={() => { clearInterval(timerRef.current); fetchAll(); }} disabled={loading} style={{
+              background: loading ? "#1a1d2e" : "#f0c040",
+              border:"none", color: loading ? "#6c7086":"#07080c",
+              padding:"3px 10px", borderRadius:4, cursor: loading?"not-allowed":"pointer",
+              fontWeight:700, fontSize:9, fontFamily:"inherit",
+            }}>{loading ? `⏳ ${phase.split("...")[0]}…` : "⟳ NOW"}</button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── STATS BAR ── */}
+      <div style={{
+        padding:"8px 20px", borderBottom:"1px solid #1a1d2e",
+        background:"#09090e", display:"flex", gap:20, alignItems:"center",
+      }}>
+        {[
+          { l:"TOTAL",       v:rows.length,                                          c:"#6c7086" },
+          { l:"FLIP LONGS",  v:rows.filter(r=>r.signal?.includes("LONG")).length,    c:"#4caf50" },
+          { l:"FLIP SHORTS", v:rows.filter(r=>r.signal?.includes("SHORT")).length,   c:"#ef5350" },
+          { l:"CONFIRMED ⚡", v:rows.filter(r=>r.signal?.endsWith("CONF")).length,   c:"#f0c040" },
+          { l:"ALERTS FIRED",v:alertLog.length,                                      c:"#cba6f7" },
+        ].map(s => (
+          <div key={s.l} style={{ textAlign:"center" }}>
+            <div style={{ fontSize:16, fontWeight:700, color:s.c }}>{s.v}</div>
+            <div style={{ fontSize:8, color:"#45475a", letterSpacing:1 }}>{s.l}</div>
+          </div>
+        ))}
+        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:10 }}>
+          {tgEnabled && (
+            <div style={{ fontSize:9, color:"#229ED9", border:"1px solid #229ED9",
+              padding:"2px 8px", borderRadius:3 }}>
+              ✈️ TG → @Fliplkbbot active
+            </div>
+          )}
+          <div style={{ fontSize:9, color:"#313244" }}>
+            {lastUpdate && `Updated ${lastUpdate.toLocaleTimeString()} · ${phase}`}
+          </div>
+        </div>
+      </div>
+
+      {/* ── ALERT LOG ── */}
+      {showLog && (
+        <div style={{
+          background:"#0b0d14", borderBottom:"1px solid #1a1d2e",
+          padding:"10px 20px", maxHeight:200, overflowY:"auto",
+        }}>
+          <div style={{ fontSize:9, color:"#f0c040", letterSpacing:2, marginBottom:8 }}>
+            📋 ALERT HISTORY ({alertLog.length})
+          </div>
+          {alertLog.length === 0 && <div style={{ color:"#45475a", fontSize:11 }}>No alerts yet this session</div>}
+          <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+            {alertLog.map(a => {
+              const m = signalMeta[a.signal];
+              return (
+                <div key={a.id} style={{ display:"flex", gap:12, alignItems:"center", fontSize:10 }}>
+                  <span style={{ color:"#45475a", minWidth:60 }}>{a.time}</span>
+                  <span style={{ color:"#cdd6f4", fontWeight:700, minWidth:80 }}>{a.symbol.replace("USDT","")}</span>
+                  <span style={{ color:m?.text??"#6c7086" }}>{m?.label??a.signal}</span>
+                  <span style={{ color:"#6c7086" }}>Pred: {parseFloat(a.predictedPct)>0?"+":""}{a.predictedPct}%</span>
+                  {a.rsi && <span style={{ color:parseFloat(a.rsi)<35?"#4caf50":"#ef5350" }}>RSI {a.rsi}</span>}
+                  {a.volRatio>2 && <span style={{ color:"#f0c040" }}>🔥 {a.volRatio}× vol</span>}
+                  <span style={{ color:"#229ED9", fontSize:9 }}>✈️ sent</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── TABS + SEARCH ── */}
+      <div style={{
+        padding:"8px 20px", borderBottom:"1px solid #1a1d2e",
+        display:"flex", gap:8, alignItems:"center",
+      }}>
+        {[
+          { k:"FLIPS",   l:`🔀 FLIPS (${rows.filter(r=>r.signal?.startsWith("FLIP")).length})` },
+          { k:"EXTREME", l:`📊 EXTREME (${rows.filter(r=>r.signal?.startsWith("EXTREME")).length})` },
+          { k:"ALL",     l:`ALL (${rows.length})` },
+        ].map(t => (
+          <button key={t.k} onClick={() => setTab(t.k)} style={{
+            background: tab===t.k?"#1a1d2e":"transparent",
+            border:`1px solid ${tab===t.k?"#f0c040":"#2a2d3e"}`,
+            color: tab===t.k?"#f0c040":"#6c7086",
+            padding:"4px 12px", borderRadius:4, cursor:"pointer",
+            fontSize:10, fontFamily:"inherit", fontWeight:tab===t.k?700:400,
+          }}>{t.l}</button>
+        ))}
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="🔍 Symbol…"
+          style={{
+            background:"#1a1d2e", border:"1px solid #2a2d3e", color:"#cdd6f4",
+            padding:"4px 10px", borderRadius:4, fontSize:10, width:100,
+            fontFamily:"inherit", outline:"none", marginLeft:8,
+          }} />
+        <div style={{ marginLeft:"auto", display:"flex", gap:2, alignItems:"center", fontSize:9, color:"#45475a" }}>
+          SORT:
+          {[["flip","FLIP SIZE"],["pred","PREDICTED"],["rsi","RSI↑"],["vol","VOL"]].map(([k,l]) => (
+            <button key={k} onClick={() => setSortBy(k)} style={{
+              background:"transparent", border:"none",
+              color: sortBy===k?"#f0c040":"#45475a",
+              cursor:"pointer", fontSize:9, fontFamily:"inherit",
+              fontWeight: sortBy===k?700:400,
+              textDecoration: sortBy===k?"underline":"none",
+              padding:"1px 5px",
+            }}>{l}</button>
+          ))}
+        </div>
+        <span style={{ fontSize:9, color:"#313244" }}>{filtered.length} rows</span>
+      </div>
+
+      {/* ── TABLE ── */}
+      <div style={{ overflowX:"auto" }}>
+        <table style={{ width:"100%", borderCollapse:"collapse" }}>
+          <thead>
+            <tr style={{ background:"#0b0d12", fontSize:8, color:"#45475a", letterSpacing:1 }}>
+              {[["#","l"],["SYMBOL","l"],["SIGNAL","l"],
+                ["PREDICTED FR","r"],["SETTLED FR","r"],["BASELINE (3P)","r"],
+                ["FLIP SIZE","r"],["HISTORY","r"],
+                ["RSI 15m","r"],["VOL RATIO","r"],
+                ["MARK PRICE","r"],["NEXT FUND","r"],
+              ].map(([h,a]) => (
+                <th key={h} style={{
+                  padding:"7px 14px", textAlign:a==="l"?"left":"right",
+                  borderBottom:"1px solid #1a1d2e", fontWeight:600,
+                }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((row, idx) => {
+              const m = row.signal ? signalMeta[row.signal] : null;
+              const pred = parseFloat(row.predictedPct);
+              const flip = parseFloat(row.deltaPct);
+              const isConf = row.signal?.endsWith("CONF");
+              const rsiNum = row.rsiNum;
+              return (
+                <tr key={row.symbol} style={{
+                  borderBottom:`1px solid ${isConf?"#1e2030":"#0f1018"}`,
+                  background: m
+                    ? isConf
+                      ? (row.signal.includes("LONG")?"rgba(0,30,15,0.9)":"rgba(30,0,5,0.9)")
+                      : (row.signal.includes("LONG")?"rgba(0,20,10,0.6)":"rgba(20,0,5,0.6)")
+                    : idx%2===0?"#07080c":"#09090e",
+                  borderLeft: m?`3px solid ${m.border}`:"3px solid transparent",
+                }}>
+                  <td style={{ padding:"9px 14px", color:"#2a2d3e", textAlign:"left" }}>{idx+1}</td>
+                  <td style={{ padding:"9px 14px", textAlign:"left", fontWeight:700 }}>
+                    <span style={{ color:"#cdd6f4", fontSize:13 }}>{row.symbol.replace("USDT","")}</span>
+                    <span style={{ color:"#2a2d3e", fontSize:9 }}>/USDT</span>
+                  </td>
+                  <td style={{ padding:"9px 14px", textAlign:"left" }}>
+                    {m ? (
+                      <span style={{
+                        border:`1px solid ${m.border}`, color:m.text,
+                        padding:"2px 8px", borderRadius:3, fontSize:9, fontWeight:700,
+                        whiteSpace:"nowrap",
+                        boxShadow: isConf?`0 0 8px ${m.border}40`:"none",
+                      }}>{m.label}</span>
+                    ) : <span style={{ color:"#2a2d3e" }}>—</span>}
+                  </td>
+                  <td style={{
+                    padding:"9px 14px", textAlign:"right", fontWeight:700, fontSize:13,
+                    color: pred<0?"#4caf50":pred>0?"#ef5350":"#45475a",
+                  }}>
+                    {pred>0?"+":""}{row.predictedPct}%
+                    <div style={{ fontSize:8, color:"#45475a", fontWeight:400 }}>PREDICTED</div>
+                  </td>
+                  <td style={{ padding:"9px 14px", textAlign:"right", color:"#6c7086", fontSize:11 }}>
+                    {parseFloat(row.settledPct)>0?"+":""}{row.settledPct}%
+                    <div style={{ fontSize:8, color:"#313244" }}>SETTLED</div>
+                  </td>
+                  <td style={{ padding:"9px 14px", textAlign:"right", color:"#45475a", fontSize:10 }}>
+                    {parseFloat(row.basePct)>0?"+":""}{row.basePct}%
+                  </td>
+                  <td style={{
+                    padding:"9px 14px", textAlign:"right", fontWeight:700,
+                    color: flip<0
+                      ? Math.abs(flip)>0.004?"#00e676":"#4caf50"
+                      : Math.abs(flip)>0.004?"#ff1744":"#ef5350",
+                  }}>
+                    {row.signFlip && (
+                      <span style={{ fontSize:8, color:"#f0c040", display:"block", animation:"pulse 1.5s infinite" }}>
+                        ↔ SIGN FLIP
+                      </span>
+                    )}
+                    {flip>0?"+":""}{row.deltaPct}%
+                  </td>
+                  <td style={{ padding:"9px 14px", textAlign:"right" }}>
+                    <HistoryBars history={row.history} current={row.predicted} />
+                  </td>
+                  <td style={{
+                    padding:"9px 14px", textAlign:"right",
+                    color: rsiNum==null?"#2a2d3e"
+                      :rsiNum<30?"#00e676":rsiNum<40?"#4caf50"
+                      :rsiNum>70?"#ff1744":rsiNum>60?"#ef5350":"#6c7086",
+                    fontWeight: rsiNum&&(rsiNum<35||rsiNum>65)?700:400,
+                  }}>{row.rsi??"—"}</td>
+                  <td style={{
+                    padding:"9px 14px", textAlign:"right",
+                    color: row.volRatio==null?"#2a2d3e"
+                      :row.volRatio>3?"#f0c040":row.volRatio>2?"#cba6f7"
+                      :row.volRatio>1.5?"#89b4fa":"#6c7086",
+                  }}>{row.volRatio!=null?`${row.volRatio}×`:"—"}</td>
+                  <td style={{ padding:"9px 14px", textAlign:"right", color:"#a6adc8" }}>
+                    {row.mark<0.01?row.mark.toFixed(6):row.mark<1?row.mark.toFixed(4):row.mark<100?row.mark.toFixed(3):row.mark.toFixed(2)}
+                  </td>
+                  <td style={{ padding:"9px 14px", textAlign:"right", color:"#45475a", fontSize:10 }}>
+                    {row.nextFunding?fmtCountdown(row.nextFunding-Date.now()):"—"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {filtered.length===0 && !loading && (
+          <div style={{ textAlign:"center", padding:80, color:"#45475a" }}>
+            <div style={{ fontSize:28, marginBottom:10 }}>🔀</div>
+            <div>No flips at {minFlip}% threshold · try lower or refresh</div>
+          </div>
+        )}
+      </div>
+
+      {/* ── FOOTER ── */}
+      <div style={{
+        padding:"10px 20px", borderTop:"1px solid #1a1d2e",
+        display:"flex", flexWrap:"wrap", gap:16,
+        fontSize:8, color:"#2a2d3e", letterSpacing:0.5,
+      }}>
+        <span>PREDICTED FR = (Mark − Index) / Index · real-time signal</span>
+        <span>↔ SIGN FLIP = direction changed vs 3-period baseline</span>
+        <span>⚡ CONF = Flip + RSI oversold/overbought confirmation</span>
+        <span>AUTO-REFRESH: 5m idle → 2m watch → 30s warm → 10s 🔥 hotzone</span>
+        <span style={{ marginLeft:"auto" }}>✈️ Telegram → @Fliplkbbot · Chat {TG_CHAT_ID}</span>
+      </div>
+    </div>
+  );
+}
